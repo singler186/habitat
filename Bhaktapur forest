@@ -1,0 +1,96 @@
+// 1. 載入您的研究區域 (Bhaktapur及其次級行政區)
+var roi = ee.FeatureCollection("projects/ee-singler97/assets/Bhaktapur");
+
+// 將地圖中心設置在研究區域
+Map.centerObject(roi, 12);
+Map.addLayer(roi, {}, 'Bhaktapur Regions');
+
+// 2. 定義欲分析的年份 (修正重覆的2001為2011)
+var years = [1991, 2001, 2011, 2021, 2025];
+
+// 去雲函數 (針對 Landsat 4/5/7 Collection 2)
+function maskL457sr(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloudShadowBitMask = (1 << 4);
+  var cloudsBitMask = (1 << 3);
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+    .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return image.updateMask(mask).copyProperties(image, ["system:time_start"]);
+}
+
+// 去雲函數 (針對 Landsat 8/9 Collection 2)
+function maskL89sr(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloudShadowBitMask = (1 << 4);
+  var cloudsBitMask = (1 << 3);
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+    .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return image.updateMask(mask).copyProperties(image, ["system:time_start"]);
+}
+
+// 3. 建立函數：取得特定年份的森林覆蓋影像
+function getForestImage(year) {
+  var startDate = year + '-01-01';
+  var endDate = year + '-12-31';
+  var image, ndvi;
+
+  if (year <= 2011) {
+    // 1991, 2001, 2011 使用 Landsat 5
+    var col5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+                .filterBounds(roi)
+                .filterDate(startDate, endDate)
+                .map(maskL457sr);
+    image = col5.median();
+    // L5 NDVI 公式: (NIR - Red) / (NIR + Red) => (B4 - B3) / (B4 + B3)
+    ndvi = image.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI');
+  } else {
+    // 2021, 2025 使用 Landsat 8/9
+    var col8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+                .filterBounds(roi)
+                .filterDate(startDate, endDate)
+                .map(maskL89sr);
+    image = col8.median();
+    // L8 NDVI 公式: (NIR - Red) / (NIR + Red) => (B5 - B4) / (B5 + B4)
+    ndvi = image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+  }
+
+  // 設定 NDVI 閾值，大於 0.5 視為森林植被 (可根據尼泊爾實際情況調整為 0.4 或 0.6)
+  var forest = ndvi.gt(0.5).rename('Forest').clip(roi);
+  return forest.set('year', year);
+}
+
+// 4. 批次處理每個年份並設定下載任務
+years.forEach(function(year) {
+  var forestImg = getForestImage(year);
+
+  // 在地圖上顯示該年份森林 (以綠色顯示)
+  Map.addLayer(forestImg.mask(forestImg), {palette: ['green']}, 'Forest ' + year, false);
+
+  // 計算每個 pixel 的面積 (平方公尺)
+  var pixelArea = ee.Image.pixelArea().updateMask(forestImg);
+
+  // 統計各次級行政區內的森林總面積
+  var stats = pixelArea.reduceRegions({
+    collection: roi,
+    reducer: ee.Reducer.sum(),
+    scale: 30, // Landsat 解析度為 30m
+  });
+
+  // 匯出為 TIF 影像檔案至 Google Drive
+  Export.image.toDrive({
+    image: forestImg,
+    description: 'Bhaktapur_Forest_TIF_' + year,
+    folder: 'GEE_Bhaktapur_Forest',
+    scale: 30,
+    region: roi.geometry(),
+    maxPixels: 1e13
+  });
+
+  // 匯出各行政區的統計結果至 CSV (方便您查看實際數字變化)
+  Export.table.toDrive({
+    collection: stats,
+    description: 'Bhaktapur_Forest_Stats_CSV_' + year,
+    folder: 'GEE_Bhaktapur_Forest',
+    fileFormat: 'CSV'
+  });
+});
